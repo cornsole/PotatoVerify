@@ -1,3 +1,9 @@
 {
-    "token": "디스코드 봇 토큰을 여기 넣으세요"
+  "token": "",
+  "guildId": "",
+  "sendChannelId": "",
+  "authChannelIds": [""],
+  "unverifiedRoleId": "",
+  "verifiedRoleId": "",
+  "adminRoleId": ""
 }
