@@ -1,10 +1,17 @@
-		const { Client, Events, GatewayIntentBits, ActivityType } = require('discord.js');
+require('dotenv').config({ quiet: true });
+
+const { Client, Events, GatewayIntentBits, ActivityType } = require('discord.js');
 const axios = require('axios'); //api로 요청을 보내기위한 모듈
 const fs = require('fs'); //로깅을 위한 모듈
-const { token } = require('./data.json');
 const user_data = fs.readFileSync('./user-data.json', 'utf8');
 const { error } = require('console');
 const LogPath = './logs'
+
+const token = process.env.DISCORD_TOKEN;
+
+if (!token) {
+	throw new Error('DISCORD_TOKEN 환경변수가 설정되지 않았습니다. .env.example을 참고해 .env 파일을 생성하세요.');
+}
 
 const client = new Client({
 	intents: [
