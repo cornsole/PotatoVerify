@@ -3,3 +3,6 @@
 !.env.example
 node_modules/
 logs/*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

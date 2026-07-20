@@ -1,198 +1,293 @@
 require('dotenv').config({ quiet: true });
 
-const { Client, Events, GatewayIntentBits, ActivityType } = require('discord.js');
-const axios = require('axios'); //api로 요청을 보내기위한 모듈
-const fs = require('fs'); //로깅을 위한 모듈
-const user_data = fs.readFileSync('./user-data.json', 'utf8');
-const { error } = require('console');
-const LogPath = './logs'
+const {
+	Client,
+	Events,
+	GatewayIntentBits,
+	ActivityType,
+	REST,
+	Routes,
+	SlashCommandBuilder,
+	PermissionFlagsBits,
+} = require('discord.js');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const { DatabaseSync } = require('node:sqlite');
 
 const token = process.env.DISCORD_TOKEN;
+const guildId = process.env.GUILD_ID;
+const adminRoleId = process.env.ADMIN_ROLE_ID;
+const verifiedRoleId = process.env.VERIFIED_ROLE_ID;
+const unverifiedRoleId = process.env.UNVERIFIED_ROLE_ID;
+const logPath = path.join(__dirname, 'logs');
+const configuredDatabasePath = process.env.DATABASE_PATH || 'user-data.sqlite';
+const databasePath = path.isAbsolute(configuredDatabasePath)
+	? configuredDatabasePath
+	: path.join(__dirname, configuredDatabasePath);
 
-if (!token) {
-	throw new Error('DISCORD_TOKEN 환경변수가 설정되지 않았습니다. .env.example을 참고해 .env 파일을 생성하세요.');
+for (const [name, value] of Object.entries({
+	DISCORD_TOKEN: token,
+	GUILD_ID: guildId,
+	ADMIN_ROLE_ID: adminRoleId,
+	VERIFIED_ROLE_ID: verifiedRoleId,
+	UNVERIFIED_ROLE_ID: unverifiedRoleId,
+})) {
+	if (!value) throw new Error(`${name} 환경변수가 설정되지 않았습니다. .env.example을 참고하세요.`);
 }
 
-const client = new Client({
-	intents: [
-		GatewayIntentBits.Guilds,
-		GatewayIntentBits.GuildMessages,
-		GatewayIntentBits.MessageContent,
-		GatewayIntentBits.GuildMembers,
-	],
-});
+fs.mkdirSync(logPath, { recursive: true });
+fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 
-function dateFormat() {
-	date = new Date()
-	let month = date.getMonth() + 1;
-	let day = date.getDate();
-	let hour = date.getHours();
-	let minute = date.getMinutes();
-	let second = date.getSeconds();
+const database = new DatabaseSync(databasePath);
+database.exec(`
+	PRAGMA journal_mode = WAL;
+	CREATE TABLE IF NOT EXISTS users (
+		mc_uuid TEXT PRIMARY KEY,
+		discord_id TEXT NOT NULL UNIQUE,
+		first_verified_at TEXT NOT NULL,
+		last_verified_at TEXT NOT NULL
+	);
+`);
 
-	month = month >= 10 ? month : '0' + month;
-	day = day >= 10 ? day : '0' + day;
-	hour = hour >= 10 ? hour : '0' + hour;
-	minute = minute >= 10 ? minute : '0' + minute;
-	second = second >= 10 ? second : '0' + second;
-
-	return date.getFullYear() + '-' + month + '-' + day + ' ' + hour + ':' + minute + ':' + second ;	
-}
-function dateNoTimeFormat() {
-	date = new Date()
-	let month = date.getMonth() + 1;
-	let day = date.getDate();
-
-	month = month >= 10 ? month : '0' + month;
-	day = day >= 10 ? day : '0' + day;
-
-	return date.getFullYear() + '-' + month + '-' + day;	
-}
-//echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
-
-function log(m){
-	console.log(`${dateFormat()} - ${m}`)
-	fs.appendFileSync(`${LogPath}/${dateNoTimeFormat()}.log`, `\n${dateFormat()} - ${m}`);
-	//save as file
+const findByUuid = database.prepare('SELECT * FROM users WHERE mc_uuid = ?');
+const findByDiscordId = database.prepare('SELECT * FROM users WHERE discord_id = ?');
+const insertUser = database.prepare(`
+	INSERT INTO users (mc_uuid, discord_id, first_verified_at, last_verified_at)
+	VALUES (?, ?, ?, ?)
+`);
+const deleteUser = database.prepare('DELETE FROM users WHERE mc_uuid = ? AND discord_id = ?');
+function now() {
+	return new Date().toISOString();
 }
 
+function displayDate(value) {
+	return new Intl.DateTimeFormat('ko-KR', {
+		timeZone: 'Asia/Seoul', dateStyle: 'medium', timeStyle: 'medium',
+	}).format(new Date(value));
+}
 
-// 뭐든지  을 앞에 쓰면 날짜와 시간을 표시해줌
+function log(message) {
+	const timestamp = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Seoul' });
+	console.log(`${timestamp} - ${message}`);
+	fs.appendFileSync(path.join(logPath, `${timestamp.slice(0, 10)}.log`), `\n${timestamp} - ${message}`);
+}
 
+function normalizeUuid(uuid) {
+	return uuid.replaceAll('-', '').toLowerCase();
+}
 
-/*
+function isValidUuid(uuid) {
+	return /^[0-9a-f]{32}$/i.test(normalizeUuid(uuid));
+}
 
-추가 아이디어
+function isAdmin(interaction) {
+	return interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+		|| interaction.member?.roles?.cache?.has(adminRoleId);
+}
 
-유저에게도 인증이 완료되면 무언가 보이게 하기
-기본적인 규칙이라던가 튜토리얼이라던가
+function duplicateMessage(existing) {
+	return `이미 인증된 계정입니다. <@&${adminRoleId}> 관리자에게 문의해 주세요. (최초 인증: ${displayDate(existing.first_verified_at)})`;
+}
 
-*/
+async function getMinecraftProfile(username) {
+	const response = await axios.get(
+		`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username.trim())}`,
+		{ timeout: 10_000 },
+	);
+	return { uuid: normalizeUuid(response.data.id), name: response.data.name };
+}
 
-client.once(Events.ClientReady, readyClient => {
-	//봇 시작 로그
-	log(`[\x1b[32m✔\x1b[0m] ${readyClient.user.tag} is started!`);
-    //봇 Activity setting (@@하는중)
-	//client.user.setActivity('potato24.xyz', { type: ActivityType.Streaming });
-	client.user.setActivity('potato24.kr', { type: ActivityType.Competing });
-	//client.user.setActivity('potato24.xyz', { type: ActivityType.Listening });
-	//client.user.setActivity('potato24.xyz', { type: ActivityType.Playing });
-	//client.user.setActivity('potato24.xyz', { type: ActivityType.Watching });
-	//client.user.setActivity('potato24.xyz 할까 생각중', { type: ActivityType.Custom});
-});
+function addUser(uuid, discordId) {
+	const existing = findByUuid.get(uuid) || findByDiscordId.get(discordId);
+	if (existing) return { created: false, user: existing };
 
-// client.on('ready' , async() =>{
-// 	console.log('시작딤')
-//     const guild = client.guilds.cache.get('976793978630438922');
-//     colors = ['fcba03'];
-//     var role = guild.roles.cache.get('1376788317391290378')
-//     setInterval(() => {
-//         const roleCount = guild.roles.cache.get(role).members.size;
-//         if(roleCount >= 1){
-//         var random = Math.floor(Math.random() * colors.length);
-//         role.edit({
-//         color: colors[random]
-//         })
-//         console.log('Rainbow Color changed, it is now: ' + colors[random])
-//         }
-//         else{
-//         console.log('No user with rainbow role')
-//         }
-                
-//     }, 600*1000)
-// });
+	const timestamp = now();
+	insertUser.run(uuid, discordId, timestamp, timestamp);
+	return { created: true, user: findByUuid.get(uuid) };
+}
 
-// 메시지 전송
-client.on('messageCreate',async(message)=>{
-	if (message.author.id!='804194370018344961') return;
-	//console.log(message)
-	if (message.content.startsWith("!send")) {
-		const channel = client.channels.cache.get('1069175615841910804');
-		channel.send(message.content.replaceAll("!send",""));
+function migrateLegacyJson(legacyPath = path.join(__dirname, 'user-data.json')) {
+	if (!fs.existsSync(legacyPath)) return;
+
+	try {
+		const rows = JSON.parse(fs.readFileSync(legacyPath, 'utf8')).users || [];
+		let migrated = 0;
+		for (const row of rows) {
+			const rawUuid = row['minecraft-uuid'] || row.mc_uuid || row.uuid || '';
+			const discordId = String(row['discord-acount'] || row.discord_id || '').trim();
+			if (!isValidUuid(rawUuid) || !/^\d{17,20}$/.test(discordId)) continue;
+
+			const uuid = normalizeUuid(rawUuid);
+			if (findByUuid.get(uuid) || findByDiscordId.get(discordId)) continue;
+			const parsedDate = new Date(row['verify-date'] || row.first_verified_at || '');
+			const timestamp = Number.isNaN(parsedDate.getTime()) ? now() : parsedDate.toISOString();
+			insertUser.run(uuid, discordId, timestamp, timestamp);
+			migrated += 1;
+		}
+		if (migrated) log(`기존 JSON에서 ${migrated}명의 인증 정보를 이전했습니다.`);
+	} catch (error) {
+		log(`기존 user-data.json 마이그레이션 실패: ${error.message}`);
+	}
+}
+
+migrateLegacyJson();
+
+const commands = [
+	new SlashCommandBuilder()
+		.setName('인증')
+		.setDescription('Minecraft 계정으로 서버 인증을 진행합니다.')
+		.addStringOption(option => option.setName('닉네임').setDescription('Minecraft 닉네임').setRequired(true)),
+	new SlashCommandBuilder()
+		.setName('수동등록')
+		.setDescription('관리자가 사용자의 Minecraft 계정을 수동 등록합니다.')
+		.addUserOption(option => option.setName('사용자').setDescription('등록할 Discord 사용자').setRequired(true))
+		.addStringOption(option => option.setName('닉네임').setDescription('Minecraft 닉네임').setRequired(true)),
+	new SlashCommandBuilder()
+		.setName('인증조회')
+		.setDescription('관리자가 사용자의 인증 정보를 조회합니다.')
+		.addUserOption(option => option.setName('사용자').setDescription('조회할 Discord 사용자'))
+		.addStringOption(option => option.setName('uuid').setDescription('조회할 Minecraft UUID')),
+	new SlashCommandBuilder()
+		.setName('전송')
+		.setDescription('관리자가 현재 채널에 봇 메시지를 전송합니다.')
+		.addStringOption(option => option.setName('내용').setDescription('전송할 메시지').setRequired(true)),
+].map(command => command.toJSON());
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+
+client.once(Events.ClientReady, async readyClient => {
+	try {
+		const rest = new REST({ version: '10' }).setToken(token);
+		await rest.put(Routes.applicationGuildCommands(readyClient.application.id, guildId), { body: commands });
+		readyClient.user.setActivity('potato24.kr', { type: ActivityType.Competing });
+		log(`[✔] ${readyClient.user.tag} 시작 및 슬래시 명령어 등록 완료`);
+	} catch (error) {
+		log(`슬래시 명령어 등록 실패: ${error.stack || error.message}`);
 	}
 });
 
-
-//유저 입장시 미인증 역할 추가
-client.on('guildMemberAdd', async (member) => {
-	log(`${member} 입장`);
-	const role = member.guild.roles.cache.get('1291568238630797428');
-	await member.roles.add(role);
-	log(`[\x1b[32m✔\x1b[0m] ${member.user.tag}님에게 역할을 지급했습니다`);
+client.on(Events.GuildMemberAdd, async member => {
+	try {
+		await member.roles.add(unverifiedRoleId);
+		log(`[✔] ${member.user.tag}님에게 미인증 역할을 지급했습니다.`);
+	} catch (error) {
+		log(`${member.user.tag} 미인증 역할 지급 실패: ${error.message}`);
+	}
 });
 
-client.on('messageCreate',async(message)=>{
-	//console.log(message)
-	if (message.content.startsWith("!whois")) {
-		if (!message.member.roles.cache.has("1376787679458627717")){
-			message.reply(`${message.author} 이 명령을 수행할 권한이 부족합니다`)
-			return;
+client.on(Events.InteractionCreate, async interaction => {
+	if (!interaction.isChatInputCommand() || interaction.guildId !== guildId) return;
+
+	try {
+		if (interaction.commandName === '인증') {
+			await interaction.deferReply({ ephemeral: true });
+			const existingDiscord = findByDiscordId.get(interaction.user.id);
+			if (existingDiscord) return interaction.editReply(duplicateMessage(existingDiscord));
+
+			const profile = await getMinecraftProfile(interaction.options.getString('닉네임', true));
+			const existingUuid = findByUuid.get(profile.uuid);
+			if (existingUuid) return interaction.editReply(duplicateMessage(existingUuid));
+
+			addUser(profile.uuid, interaction.user.id);
+			try {
+				await interaction.member.roles.add(verifiedRoleId);
+			} catch (error) {
+				deleteUser.run(profile.uuid, interaction.user.id);
+				throw error;
+			}
+			await interaction.member.roles.remove(unverifiedRoleId).catch(() => {});
+			log(`${interaction.user.tag} 인증 완료: ${profile.name} (${profile.uuid})`);
+			return interaction.editReply(`✅ 인증 완료: **${profile.name}**`);
 		}
-		var username = message.content.replaceAll("!whois","")
-		//const channel = client.channels.cache.get('1397084660005077003');
-		//channel.send(message.content.replaceAll("!whois",""));
-		message.channel.send(`${user}님의 인증정보를 조회합니다..`)
-		try{
-			const jsonData = JSON.parse(user_data);
-			const users = jsonData.users;
-			
-			users.forEach(user => {
-				if (user.uuid==username){
-					message.channel.send(`${user}`)
+
+		if (!isAdmin(interaction)) {
+			return interaction.reply({ content: '이 명령어는 관리자만 사용할 수 있습니다.', ephemeral: true });
+		}
+
+		if (interaction.commandName === '수동등록') {
+			await interaction.deferReply({ ephemeral: true });
+			const target = interaction.options.getUser('사용자', true);
+			const profile = await getMinecraftProfile(interaction.options.getString('닉네임', true));
+			const result = addUser(profile.uuid, target.id);
+			if (!result.created) return interaction.editReply(duplicateMessage(result.user));
+
+			const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+			if (member) {
+				try {
+					await member.roles.add(verifiedRoleId);
+				} catch (error) {
+					deleteUser.run(profile.uuid, target.id);
+					throw error;
 				}
-				messagmessagech.send(`${user}`)
+				await member.roles.remove(unverifiedRoleId).catch(() => {});
+			}
+			log(`${interaction.user.tag}님이 ${target.tag} 수동 등록: ${profile.name} (${profile.uuid})`);
+			return interaction.editReply(`✅ ${target}님을 **${profile.name}** 계정으로 등록했습니다.`);
+		}
+
+		if (interaction.commandName === '인증조회') {
+			const target = interaction.options.getUser('사용자');
+			const uuidInput = interaction.options.getString('uuid');
+			if (!target && !uuidInput) {
+				return interaction.reply({ content: '사용자 또는 UUID 중 하나를 입력해 주세요.', ephemeral: true });
+			}
+			const user = target
+				? findByDiscordId.get(target.id)
+				: (isValidUuid(uuidInput) ? findByUuid.get(normalizeUuid(uuidInput)) : null);
+			if (!user) return interaction.reply({ content: '인증 정보를 찾을 수 없습니다.', ephemeral: true });
+			return interaction.reply({
+				content: `Discord: <@${user.discord_id}>\nMinecraft UUID: \`${user.mc_uuid}\`\n최초 인증: ${displayDate(user.first_verified_at)}\n마지막 인증: ${displayDate(user.last_verified_at)}`,
+				ephemeral: true,
 			});
-			// fs.readFile('user-data.json', 'utf8', function(err, data) {
-			// 	message.channel.send(`${data.minecraft}`)
-			// 	console.log(JSON.parse(data).user)
-			// });
-
-		}catch(err){
-			message.channel.send(`${user} 유저를 찾을 수 없습니다 ${err}`)
 		}
+
+		if (interaction.commandName === '전송') {
+			await interaction.channel.send(interaction.options.getString('내용', true));
+			return interaction.reply({ content: '메시지를 전송했습니다.', ephemeral: true });
+		}
+	} catch (error) {
+		const notFound = axios.isAxiosError(error) && error.response?.status === 404;
+		const message = notFound
+			? '올바른 Minecraft 닉네임을 입력해 주세요.'
+			: '처리 중 오류가 발생했습니다. 관리자에게 문의해 주세요.';
+		log(`${interaction.commandName} 처리 실패: ${error.stack || error.message}`);
+		if (interaction.deferred || interaction.replied) await interaction.editReply(message).catch(() => {});
+		else await interaction.reply({ content: message, ephemeral: true }).catch(() => {});
 	}
 });
 
-//유저가 보낸 메시지 검사
-client.on('messageCreate', async(message,member,guild) => {
-	if (message.author.bot) return; //봇 무시
-	if (message.content===``) return;
-	if (!(message.channel.id == '976794485528875008' || message.channel.id == '1401046975151083620')) return; //인증체널 외에는 무시
+function shutdown() {
+	client.destroy();
+	database.close();
+}
 
-	const iskorean = new RegExp("[ㄱ-ㅎ|ㅏ-ㅣ|가-힣]");
- 
-	if (message.content.match(iskorean)){
-		message.reply("-# 메시지에 한글이 포함되어 있습니다 닉네임만 작성해주십시오")
-		return;
-	}
-
-    log(`${message.author.username}(${message.author.id}) > ${message}`) //남긴 메시지 표시
-    //모장api로 올바른 UUID인지 물어보기
-    //message.content.trim() <- 문자열 좌우 공백을 제거
-    try {
-        const response = await axios.get(`https://api.mojang.com/users/profiles/minecraft/${message.content.trim()}`); //모장 api로 요청을 보낸다음 정보를 response로 저장
-        console.log(response.data) //json으로 뽑아줌
-        //console.log(response.data.id) //UUID만 뽑아줌
-		message.reply(`-# ✅ 인증완료 ${response.data.id}`)
-		
-		log(`${message.author.username} 인증완료`)
-
-    	await message.member.roles.add('976794246742966302');
-		await message.member.roles.remove('1291568238630797428');
-		
-    } catch (error){
-        //error
-		
-		if (error==`AxiosError: Request failed with status code 404`){
-			message.reply(`-# **올바르지 않는 닉네임** | 또는 api에서 오류가 발생하였습니다 <@&1221809675293425746>`)
-		}else{
-			message.reply(`-# 올바르지 않는 닉네임 | 또는 내부에서 오류가 발생하였습니다 <@&1221809675293425746>\n-# ${error}`)
-			console.log(error)
-		}
-
-    }
-    
-    
+process.once('SIGINT', () => {
+	shutdown();
+	process.exit(0);
 });
 
-client.login(token);
+process.once('SIGTERM', () => {
+	shutdown();
+	process.exit(0);
+});
+
+if (require.main === module) {
+	client.login(token).catch(error => {
+		log(`Discord 로그인 실패: ${error.stack || error.message}`);
+		shutdown();
+		process.exitCode = 1;
+	});
+}
+
+module.exports = {
+	commands,
+	normalizeUuid,
+	isValidUuid,
+	isAdmin,
+	addUser,
+	findByUuid,
+	findByDiscordId,
+	migrateLegacyJson,
+	shutdown,
+};
